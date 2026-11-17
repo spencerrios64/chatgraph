@@ -1,0 +1,138 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>chatgraph</title><script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script><style>:root{--bg:#0f1117;--card:#181b24;--bd:#2a2f3d;--tx:#e6e8ee;--mut:#8b92a6;--ac:#7c9cff}
+*{box-sizing:border-box}body{margin:0;font:15px/1.5 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--tx)}
+main{max-width:980px;margin:0 auto;padding:24px 16px 60px}h1{margin:.2em 0}p.sub{color:var(--mut);margin-top:0}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin:14px 0}
+.drop{border:2px dashed var(--bd);border-radius:12px;padding:28px;text-align:center;color:var(--mut);cursor:pointer}
+.drop.over,.drop:hover{border-color:var(--ac);color:var(--tx)}
+button,select,input,textarea{font:inherit;color:var(--tx);background:#10131b;border:1px solid var(--bd);border-radius:8px;padding:8px 12px}
+button{cursor:pointer;background:var(--ac);color:#0b0e16;border:0;font-weight:600}button.sec{background:#222736;color:var(--tx)}
+button:disabled{opacity:.4;cursor:default}input[type=text],input:not([type]),textarea{width:100%}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.mut{color:var(--mut)}.pill{background:#222736;border-radius:99px;padding:2px 10px;font-size:12px;color:var(--mut)}
+.hit{border-top:1px solid var(--bd);padding:10px 0}.hit:first-child{border:0}mark{background:#5a4b00;color:#ffe98a;border-radius:3px}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--bd);padding:6px 8px;text-align:left}
+.note{font-size:13px;color:var(--mut)}canvas{width:100%;background:#0b0d13;border-radius:12px;border:1px solid var(--bd)}
+</style></head><body><main><h1>chatgraph</h1><p class="sub">Turn your AI chats into a knowledge graph, like Obsidian or Graphify. Chats are nodes, shared topics are links. Export as an Obsidian vault with [[wikilinks]]. Runs in your browser.</p>
+<div class="card"><div class="drop" id="drop">Drop Claude / ChatGPT exports here</div><div id="status" class="note"></div></div>
+<div class="card" id="ctl" hidden><div class="row"><input id="flt" placeholder="Filter by topic or title" style="flex:1"><label>Min shared topics <b id="mv">2</b></label><input type="range" id="mn" min="1" max="6" value="2"><button id="vault">Export Obsidian vault (.zip)</button></div></div>
+<canvas id="cv" height="560" hidden></canvas><div class="card" id="info" hidden></div>
+<script>
+/* shared core: parse AI chat exports in the browser (nothing is uploaded) */
+const Chats = (() => {
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  function textOfClaude(m){
+    if (m.text) return m.text;
+    if (Array.isArray(m.content)) return m.content.map(c => c.text || '').join('\n');
+    return '';
+  }
+  function parseData(data, name){
+    const out = [];
+    if (!Array.isArray(data)) data = data && data.conversations ? data.conversations : [data];
+    for (const c of data){
+      if (!c) continue;
+      if (c.chat_messages){ // Claude
+        out.push({id:c.uuid||c.id||name+out.length, title:c.name||'(untitled)', ai:'Claude',
+          created:c.created_at||'', messages:c.chat_messages.map(m=>({role:m.sender==='human'?'user':'assistant', text:textOfClaude(m)})).filter(m=>m.text)});
+      } else if (c.mapping){ // ChatGPT
+        const msgs = Object.values(c.mapping).map(n=>n.message).filter(m=>m&&m.content&&m.author&&m.author.role!=='system'&&m.author.role!=='tool')
+          .sort((a,b)=>(a.create_time||0)-(b.create_time||0))
+          .map(m=>({role:m.author.role, text:(m.content.parts||[]).filter(p=>typeof p==='string').join('\n')})).filter(m=>m.text.trim());
+        out.push({id:c.conversation_id||c.id||name+out.length, title:c.title||'(untitled)', ai:'ChatGPT',
+          created:c.create_time?new Date(c.create_time*1000).toISOString():'', messages:msgs});
+      } else if (Array.isArray(c.messages)){ // generic
+        out.push({id:c.id||name+out.length, title:c.title||c.name||'(untitled)', ai:c.ai||c.source||'Other',
+          created:c.created||c.created_at||'', messages:c.messages.map(m=>({role:m.role||(m.sender==='human'?'user':'assistant'), text:m.text||m.content||''})).filter(m=>m.text)});
+      }
+    }
+    return out;
+  }
+  async function loadFiles(fileList){
+    let all = [];
+    for (const f of fileList){
+      if (/\.zip$/i.test(f.name) && window.JSZip){
+        const z = await JSZip.loadAsync(f);
+        for (const [n, e] of Object.entries(z.files)){
+          if (!e.dir && /\.json$/i.test(n) && /conversation|chat/i.test(n)){
+            try { all = all.concat(parseData(JSON.parse(await e.async('string')), n)); } catch(_){}
+          }
+        }
+      } else if (/\.jsonl$/i.test(f.name)){
+        const lines = (await f.text()).split('\n').filter(Boolean);
+        try { all = all.concat(parseData(lines.map(l=>JSON.parse(l)), f.name)); } catch(_){}
+      } else {
+        try { all = all.concat(parseData(JSON.parse(await f.text()), f.name)); } catch(_){}
+      }
+    }
+    return all;
+  }
+  const fullText = c => c.messages.map(m=>m.text).join('\n');
+  const STOP = new Set('the a an and or but if of to in on at for with from by is are was were be been it this that these those i you he she we they me my your our their as not no so do does did can could would should will just have has had about into than then there what which who how when why also more some any all one'.split(' '));
+  const tokens = s => (s.toLowerCase().match(/[a-z0-9À-ɏͰ-Ͽ]{2,}/g)||[]).filter(w=>!STOP.has(w));
+  function download(name, content, type){
+    const b = content instanceof Blob ? content : new Blob([content], {type: type||'text/plain'});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = name; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+  }
+  const PATTERNS = [
+    [/sk-[A-Za-z0-9_\-]{20,}/g,'[API_KEY]'],[/AIza[0-9A-Za-z_\-]{30,}/g,'[API_KEY]'],[/gh[pousr]_[A-Za-z0-9]{30,}/g,'[GITHUB_TOKEN]'],
+    [/AKIA[0-9A-Z]{16}/g,'[AWS_KEY]'],[/[\w.+-]+@[\w-]+\.[\w.-]+/g,'[EMAIL]'],[/\bhttps?:\/\/[^\s)]+/g,m=>m],
+    [/(?<!\d)\+?\d[\d\s().-]{8,}\d(?!\d)/g,'[PHONE]'],[/\b(?:\d[ -]*?){13,16}\b/g,'[CARD]']
+  ];
+  const scrub = s => PATTERNS.reduce((t,[re,r])=>t.replace(re,r), s);
+  return {esc, parseData, loadFiles, fullText, tokens, download, scrub};
+})();
+const $ = s => document.querySelector(s);
+function dropzone(el, cb){
+  el.addEventListener('dragover', e=>{e.preventDefault(); el.classList.add('over');});
+  el.addEventListener('dragleave', ()=>el.classList.remove('over'));
+  el.addEventListener('drop', e=>{e.preventDefault(); el.classList.remove('over'); cb(e.dataTransfer.files);});
+  const inp = document.createElement('input'); inp.type='file'; inp.multiple=true; inp.hidden=true; inp.accept='.json,.jsonl,.zip';
+  el.after(inp); el.addEventListener('click', ()=>inp.click()); inp.addEventListener('change', ()=>cb(inp.files));
+}
+
+
+let docs=[],nodes=[],links=[],topicsOf=[],sel=null,drag=null;
+const COLORS={Claude:'#d99a6c',ChatGPT:'#6cd9a4',Other:'#7c9cff'};
+function topics(d){const tf={};Chats.tokens(d.title+' '+d.title+' '+Chats.fullText(d)).forEach(w=>tf[w]=(tf[w]||0)+1);return tf}
+function build(){
+  const df={};const tfs=docs.map(topics);tfs.forEach(t=>Object.keys(t).forEach(w=>df[w]=(df[w]||0)+1));
+  topicsOf=tfs.map(t=>Object.entries(t).filter(([w,f])=>f>=3&&df[w]>=2&&df[w]<docs.length*.25).map(([w,f])=>[w,f*Math.log(docs.length/df[w])]).sort((a,b)=>b[1]-a[1]).slice(0,8).map(x=>x[0]));
+  const W=$('#cv').clientWidth,H=560;nodes=docs.map((d,i)=>({i,x:W/2+(Math.random()-.5)*W*.6,y:H/2+(Math.random()-.5)*H*.6,vx:0,vy:0,r:4+Math.min(10,Math.sqrt(d.messages.length))}));
+  rebuildLinks();
+}
+function rebuildLinks(){
+  const mn=+$('#mn').value,flt=$('#flt').value.toLowerCase();$('#mv').textContent=mn;links=[];
+  const by={};topicsOf.forEach((ts,i)=>ts.forEach(t=>(by[t]=by[t]||[]).push(i)));
+  const cnt={};Object.values(by).forEach(l=>{for(let a=0;a<l.length;a++)for(let b=a+1;b<l.length;b++){const k=l[a]+','+l[b];cnt[k]=(cnt[k]||0)+1}});
+  Object.entries(cnt).forEach(([k,c])=>{if(c>=mn){const[a,b]=k.split(',').map(Number);links.push({a,b,c})}});
+  nodes.forEach(n=>{const d=docs[n.i];n.dim=flt&&!(d.title.toLowerCase().includes(flt)||topicsOf[n.i].some(t=>t.includes(flt)))});
+}
+function tick(){
+  const cv=$('#cv'),W=cv.clientWidth,H=560;
+  for(const a of nodes){for(const b of nodes){if(a===b)continue;let dx=a.x-b.x,dy=a.y-b.y,d2=dx*dx+dy*dy+.01;if(d2<30000){const f=400/d2;a.vx+=dx*f;a.vy+=dy*f}}
+    a.vx+=(W/2-a.x)*.0008;a.vy+=(H/2-a.y)*.0008}
+  for(const l of links){const a=nodes[l.a],b=nodes[l.b];const dx=b.x-a.x,dy=b.y-a.y,d=Math.hypot(dx,dy)||1,f=(d-70)*.004*Math.min(l.c,3);a.vx+=dx/d*f;a.vy+=dy/d*f;b.vx-=dx/d*f;b.vy-=dy/d*f}
+  for(const n of nodes){if(n===drag)continue;n.vx*=.85;n.vy*=.85;n.x=Math.max(10,Math.min(W-10,n.x+n.vx));n.y=Math.max(10,Math.min(H-10,n.y+n.vy))}
+  const x=cv.getContext('2d');cv.width=W*2;cv.height=H*2;x.scale(2,2);
+  x.strokeStyle='#2a2f3d';links.forEach(l=>{x.globalAlpha=nodes[l.a].dim||nodes[l.b].dim?.1:.7;x.lineWidth=Math.min(3,l.c*.6);x.beginPath();x.moveTo(nodes[l.a].x,nodes[l.a].y);x.lineTo(nodes[l.b].x,nodes[l.b].y);x.stroke()});
+  nodes.forEach(n=>{x.globalAlpha=n.dim?.15:1;x.fillStyle=COLORS[docs[n.i].ai]||COLORS.Other;x.beginPath();x.arc(n.x,n.y,n.r,0,7);x.fill();if(n===sel){x.strokeStyle='#fff';x.lineWidth=2;x.stroke()}});
+  requestAnimationFrame(tick);
+}
+function pick(e){const r=$('#cv').getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;return nodes.find(n=>Math.hypot(n.x-mx,n.y-my)<n.r+4)}
+const cv=$('#cv');
+cv.onmousedown=e=>{const n=pick(e);if(n){drag=sel=n;show(n)}};
+cv.onmousemove=e=>{if(drag){const r=cv.getBoundingClientRect();drag.x=e.clientX-r.left;drag.y=e.clientY-r.top;drag.vx=drag.vy=0}};
+window.onmouseup=()=>drag=null;
+function show(n){const d=docs[n.i];const nb=links.filter(l=>l.a===n.i||l.b===n.i).map(l=>docs[l.a===n.i?l.b:l.a].title);
+  $('#info').hidden=false;$('#info').innerHTML=`<b>${Chats.esc(d.title)}</b> <span class="pill">${d.ai}</span> <span class="note">${d.created.slice(0,10)} · ${d.messages.length} msgs</span><p>Topics: ${topicsOf[n.i].map(t=>`<span class="pill">${Chats.esc(t)}</span>`).join(' ')||'—'}</p><p class="note">Linked to: ${nb.slice(0,12).map(Chats.esc).join(' · ')||'nothing yet'}</p><p>${Chats.esc(d.messages[0]?d.messages[0].text.slice(0,300):'')}</p>`}
+const safe=s=>s.replace(/[\\/:*?"<>|#^\[\]]/g,' ').replace(/\s+/g,' ').trim().slice(0,80)||'untitled';
+$('#vault').onclick=async()=>{const z=new JSZip(),names=docs.map((d,i)=>safe(d.title)+' '+i);
+  docs.forEach((d,i)=>{const nb=[...new Set(links.filter(l=>l.a===i||l.b===i).map(l=>names[l.a===i?l.b:l.a]))];
+    const md=`---\nai: ${d.ai}\ndate: ${d.created.slice(0,10)}\ntags: [${topicsOf[i].join(', ')}]\n---\n# ${d.title}\n\n## Related\n${nb.map(n=>`- [[${n}]]`).join('\n')||'- (none)'}\n\n## Conversation\n`+d.messages.map(m=>`**${m.role==='user'?'Me':d.ai}:** ${m.text}`).join('\n\n');
+    z.file(names[i]+'.md',md)});
+  topicsOf.flat().filter((t,i,a)=>a.indexOf(t)===i);
+  Chats.download('chatgraph-vault.zip',await z.generateAsync({type:'blob'}))};
+dropzone($('#drop'),async fl=>{$('#status').textContent='Reading…';docs=await Chats.loadFiles(fl);if(!docs.length){$('#status').textContent='No chats found.';return}
+  $('#ctl').hidden=false;cv.hidden=false;build();$('#status').textContent=`${docs.length} chats, ${links.length} links.`;if(!window._r){window._r=1;tick()}});
+$('#mn').oninput=rebuildLinks;$('#flt').oninput=rebuildLinks;
+</script>
+</main></body></html>
